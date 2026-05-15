@@ -3,7 +3,13 @@
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <Wire.h>
 #include <driver/i2s.h>
+
+#if ENABLE_OLED_DISPLAY
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#endif
 
 #ifndef MIC_SAMPLE_RATE
 #define MIC_SAMPLE_RATE 16000
@@ -29,7 +35,80 @@
 #define MIC_SAMPLE_SHIFT 11
 #endif
 
+#ifndef ENABLE_ES8311_CODEC
+#define ENABLE_ES8311_CODEC 0
+#endif
+
+#ifndef ES8311_ADDR
+#define ES8311_ADDR 0x18
+#endif
+
+#ifndef ES8311_I2C_SDA_PIN
+#define ES8311_I2C_SDA_PIN OLED_SDA_PIN
+#endif
+
+#ifndef ES8311_I2C_SCL_PIN
+#define ES8311_I2C_SCL_PIN OLED_SCL_PIN
+#endif
+
+#ifndef I2S_DOUT_PIN
+#define I2S_DOUT_PIN SPEAKER_DATA_PIN
+#endif
+
+#ifndef I2S_MCLK_PIN
+#define I2S_MCLK_PIN I2S_PIN_NO_CHANGE
+#endif
+
+#ifndef PA_ENABLE_PIN
+#define PA_ENABLE_PIN -1
+#endif
+
+#ifndef ENABLE_SPEAKER
+#define ENABLE_SPEAKER 0
+#endif
+
+#ifndef SPEAKER_BCLK_PIN
+#define SPEAKER_BCLK_PIN 7
+#endif
+
+#ifndef SPEAKER_LRCLK_PIN
+#define SPEAKER_LRCLK_PIN 15
+#endif
+
+#ifndef SPEAKER_DATA_PIN
+#define SPEAKER_DATA_PIN 16
+#endif
+
+#ifndef SPEAKER_GAIN_PERCENT
+#define SPEAKER_GAIN_PERCENT 70
+#endif
+
+#ifndef ENABLE_OLED_DISPLAY
+#define ENABLE_OLED_DISPLAY 0
+#endif
+
+#ifndef OLED_SDA_PIN
+#define OLED_SDA_PIN 8
+#endif
+
+#ifndef OLED_SCL_PIN
+#define OLED_SCL_PIN 9
+#endif
+
+#ifndef OLED_WIDTH
+#define OLED_WIDTH 128
+#endif
+
+#ifndef OLED_HEIGHT
+#define OLED_HEIGHT 64
+#endif
+
 static constexpr i2s_port_t I2S_PORT = I2S_NUM_0;
+#if SOC_I2S_NUM > 1
+static constexpr i2s_port_t SPEAKER_I2S_PORT = I2S_NUM_1;
+#else
+static constexpr i2s_port_t SPEAKER_I2S_PORT = I2S_NUM_0;
+#endif
 static constexpr uint32_t AUDIO_MAGIC = 0x30445541; // "AUD0", little-endian on the wire.
 static constexpr uint8_t AUDIO_CODEC_PCM16 = 0;
 static constexpr uint8_t AUDIO_CODEC_IMA_ADPCM = 1;
@@ -40,6 +119,7 @@ static constexpr byte DNS_PORT = 53;
 static constexpr const char *AP_SSID = "LeOSListener";
 static constexpr const char *AP_PASSWORD = "LeOSListener";
 static constexpr size_t I2S_WORDS_PER_FRAME = MIC_FRAME_SAMPLES * 2;
+static constexpr size_t DOWNLINK_BUFFER_SIZE = 1600;
 
 struct __attribute__((packed)) AudioFrameHeader {
   uint32_t magic;
@@ -77,19 +157,32 @@ static WiFiClient audioClient;
 static RuntimeConfig config;
 
 static int32_t i2sBuffer[I2S_WORDS_PER_FRAME];
+static int16_t codecRxBuffer[MIC_FRAME_SAMPLES];
 static int16_t pcmBuffer[MIC_FRAME_SAMPLES];
+static int16_t downlinkPcmBuffer[MIC_FRAME_SAMPLES];
 static uint8_t adpcmBuffer[(MIC_FRAME_SAMPLES + 1) / 2];
 static uint8_t txBuffer[sizeof(AudioFrameHeader) + sizeof(pcmBuffer)];
+static uint8_t downlinkBuffer[DOWNLINK_BUFFER_SIZE];
 
 static String apName;
 static bool apEnabled = false;
+static bool speakerReady = false;
+#if ENABLE_OLED_DISPLAY
+static Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+static bool displayReady = false;
+#endif
 static uint32_t lastWifiAttemptMs = 0;
 static uint32_t lastTcpAttemptMs = 0;
 static uint32_t lastStatusMs = 0;
+static uint32_t lastDisplayMs = 0;
 static size_t lastSamplesRead = 0;
 static size_t lastWordsRead = 0;
+static size_t downlinkBytesBuffered = 0;
+static uint32_t lastDownlinkMs = 0;
 static uint32_t statusFramesSent = 0;
 static uint32_t statusPayloadBytesSent = 0;
+static uint32_t statusDownlinkFrames = 0;
+static uint32_t statusDownlinkBytes = 0;
 static float hpPrevInput = 0.0f;
 static float hpPrevOutput = 0.0f;
 static constexpr float HIGH_PASS_ALPHA = 0.955f;
@@ -139,7 +232,103 @@ static const char *channelModeLabel(uint8_t mode) {
 }
 
 static const char *slotLabel(uint8_t slot) {
+#if ENABLE_ES8311_CODEC
+  (void)slot;
+  return "codec";
+#else
   return slot == 0 ? "left" : "right";
+#endif
+}
+
+static bool i2cWriteReg(uint8_t addr, uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+static uint8_t i2cReadReg(uint8_t addr, uint8_t reg) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) {
+    return 0xFF;
+  }
+  if (Wire.requestFrom(static_cast<int>(addr), 1) != 1) {
+    return 0xFF;
+  }
+  return Wire.read();
+}
+
+static bool es8311Write(uint8_t reg, uint8_t value) {
+  return i2cWriteReg(ES8311_ADDR, reg, value);
+}
+
+static uint8_t es8311Read(uint8_t reg) {
+  return i2cReadReg(ES8311_ADDR, reg);
+}
+
+static bool setupEs8311Codec() {
+#if ENABLE_ES8311_CODEC
+  Wire.begin(ES8311_I2C_SDA_PIN, ES8311_I2C_SCL_PIN);
+  bool ok = true;
+  ok &= es8311Write(0x44, 0x08);
+  ok &= es8311Write(0x44, 0x08);
+  ok &= es8311Write(0x01, 0x30);
+  ok &= es8311Write(0x02, 0x00);
+  ok &= es8311Write(0x03, 0x10);
+  ok &= es8311Write(0x16, 0x24);
+  ok &= es8311Write(0x04, 0x10);
+  ok &= es8311Write(0x05, 0x00);
+  ok &= es8311Write(0x0B, 0x00);
+  ok &= es8311Write(0x0C, 0x00);
+  ok &= es8311Write(0x10, 0x1F);
+  ok &= es8311Write(0x11, 0x7F);
+  ok &= es8311Write(0x00, 0x80);
+  ok &= es8311Write(0x00, es8311Read(0x00) & 0xBF); // ES8311 slave, ESP32 provides clocks.
+  ok &= es8311Write(0x01, 0x3F);
+  ok &= es8311Write(0x01, es8311Read(0x01) & 0x7F); // MCLK from MCLK pin.
+  ok &= es8311Write(0x01, es8311Read(0x01) & ~0x40); // Normal MCLK polarity.
+  ok &= es8311Write(0x06, es8311Read(0x06) & ~0x20); // Normal BCLK polarity.
+
+  // Clock coefficients for MCLK=12.288MHz, sample rate=16kHz.
+  ok &= es8311Write(0x02, 0x40);
+  ok &= es8311Write(0x05, 0x00);
+  ok &= es8311Write(0x03, 0x10);
+  ok &= es8311Write(0x04, 0x20);
+  ok &= es8311Write(0x07, 0x00);
+  ok &= es8311Write(0x08, 0xFF);
+  ok &= es8311Write(0x06, 0x03);
+
+  // I2S normal format, 16-bit samples.
+  ok &= es8311Write(0x09, (es8311Read(0x09) & 0xE3) | 0x0C);
+  ok &= es8311Write(0x0A, (es8311Read(0x0A) & 0xE3) | 0x0C);
+
+  ok &= es8311Write(0x13, 0x10);
+  ok &= es8311Write(0x1B, 0x0A);
+  ok &= es8311Write(0x1C, 0x6A);
+  ok &= es8311Write(0x09, es8311Read(0x09) & ~0x40);
+  ok &= es8311Write(0x0A, es8311Read(0x0A) & ~0x40);
+  ok &= es8311Write(0x17, 0xBF);
+  ok &= es8311Write(0x0E, 0x02);
+  ok &= es8311Write(0x12, 0x00);
+  ok &= es8311Write(0x14, 0x1A);
+  ok &= es8311Write(0x0D, 0x01);
+  ok &= es8311Write(0x15, 0x40);
+  ok &= es8311Write(0x37, 0x08);
+  ok &= es8311Write(0x45, 0x00);
+  ok &= es8311Write(0x44, 0x58);
+  ok &= es8311Write(0x32, 0xBF); // DAC volume.
+  ok &= es8311Write(0x31, es8311Read(0x31) & 0x9F); // DAC unmute.
+  Serial.printf("ES8311 addr=0x%02x chip=%02x:%02x:%02x init=%s\n",
+                ES8311_ADDR,
+                es8311Read(0xFD),
+                es8311Read(0xFE),
+                es8311Read(0xFF),
+                ok ? "ok" : "partial");
+  return ok;
+#else
+  return true;
+#endif
 }
 
 static void resetVoiceState() {
@@ -169,18 +358,18 @@ static String htmlEscape(const String &value) {
 }
 
 static void loadConfig() {
-  preferences.begin("micwifi", true);
-  config.ssid = preferences.getString("ssid", "");
-  config.password = preferences.getString("pass", "");
-  config.serverHost = preferences.getString("host", "");
-  config.serverPort = preferences.getUShort("port", DEFAULT_SERVER_PORT);
-  config.sampleShift = sanitizeSampleShift(preferences.getUChar("shift", 12));
-  config.inputGain = preferences.getFloat("gain", 1.2f);
-  config.noiseGate = preferences.getUShort("gate", 260);
-  config.highPass = preferences.getBool("hpass", true);
-  config.agcEnabled = preferences.getBool("agc", true);
-  config.agcTarget = preferences.getUShort("agctgt", 6200);
-  config.channelMode = sanitizeChannelMode(preferences.getUChar("chmode", CHANNEL_AUTO));
+  preferences.begin("micwifi", false);
+  config.ssid = preferences.isKey("ssid") ? preferences.getString("ssid", "") : "";
+  config.password = preferences.isKey("pass") ? preferences.getString("pass", "") : "";
+  config.serverHost = preferences.isKey("host") ? preferences.getString("host", "") : "";
+  config.serverPort = preferences.isKey("port") ? preferences.getUShort("port", DEFAULT_SERVER_PORT) : DEFAULT_SERVER_PORT;
+  config.sampleShift = sanitizeSampleShift(preferences.isKey("shift") ? preferences.getUChar("shift", 12) : 12);
+  config.inputGain = preferences.isKey("gain") ? preferences.getFloat("gain", 1.2f) : 1.2f;
+  config.noiseGate = preferences.isKey("gate") ? preferences.getUShort("gate", 260) : 260;
+  config.highPass = preferences.isKey("hpass") ? preferences.getBool("hpass", true) : true;
+  config.agcEnabled = preferences.isKey("agc") ? preferences.getBool("agc", true) : true;
+  config.agcTarget = preferences.isKey("agctgt") ? preferences.getUShort("agctgt", 6200) : 6200;
+  config.channelMode = sanitizeChannelMode(preferences.isKey("chmode") ? preferences.getUChar("chmode", CHANNEL_AUTO) : CHANNEL_AUTO);
   preferences.end();
 }
 
@@ -412,6 +601,26 @@ static void setupConfigPortal() {
 
 static void setupI2SMicrophone() {
   i2s_config_t i2sConfig = {};
+#if ENABLE_ES8311_CODEC
+  i2sConfig.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX | I2S_MODE_TX);
+  i2sConfig.sample_rate = MIC_SAMPLE_RATE;
+  i2sConfig.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  i2sConfig.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+  i2sConfig.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  i2sConfig.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  i2sConfig.dma_buf_count = 8;
+  i2sConfig.dma_buf_len = MIC_FRAME_SAMPLES;
+  i2sConfig.use_apll = false;
+  i2sConfig.tx_desc_auto_clear = true;
+  i2sConfig.fixed_mclk = 12288000;
+
+  i2s_pin_config_t pins = {};
+  pins.mck_io_num = I2S_MCLK_PIN;
+  pins.bck_io_num = I2S_BCLK_PIN;
+  pins.ws_io_num = I2S_LRCLK_PIN;
+  pins.data_out_num = I2S_DOUT_PIN;
+  pins.data_in_num = I2S_DATA_PIN;
+#else
   i2sConfig.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX);
   i2sConfig.sample_rate = MIC_SAMPLE_RATE;
   i2sConfig.bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT;
@@ -431,10 +640,124 @@ static void setupI2SMicrophone() {
   pins.ws_io_num = I2S_LRCLK_PIN;
   pins.data_out_num = I2S_PIN_NO_CHANGE;
   pins.data_in_num = I2S_DATA_PIN;
+#endif
 
   ESP_ERROR_CHECK(i2s_driver_install(I2S_PORT, &i2sConfig, 0, nullptr));
   ESP_ERROR_CHECK(i2s_set_pin(I2S_PORT, &pins));
   ESP_ERROR_CHECK(i2s_zero_dma_buffer(I2S_PORT));
+}
+
+static void setupSpeaker() {
+#if ENABLE_SPEAKER
+#if ENABLE_ES8311_CODEC
+  if (PA_ENABLE_PIN >= 0) {
+    pinMode(PA_ENABLE_PIN, OUTPUT);
+    digitalWrite(PA_ENABLE_PIN, LOW);
+  }
+  speakerReady = setupEs8311Codec();
+  if (PA_ENABLE_PIN >= 0) {
+    digitalWrite(PA_ENABLE_PIN, speakerReady ? HIGH : LOW);
+  }
+  Serial.printf("ES8311 speaker %s pa=%d dout=%d mclk=%d bclk=%d ws=%d din=%d gain=%d%%\n",
+                speakerReady ? "ready" : "failed",
+                PA_ENABLE_PIN,
+                I2S_DOUT_PIN,
+                I2S_MCLK_PIN,
+                I2S_BCLK_PIN,
+                I2S_LRCLK_PIN,
+                I2S_DATA_PIN,
+                SPEAKER_GAIN_PERCENT);
+#else
+  i2s_config_t i2sConfig = {};
+  i2sConfig.mode = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX);
+  i2sConfig.sample_rate = MIC_SAMPLE_RATE;
+  i2sConfig.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  i2sConfig.channel_format = I2S_CHANNEL_FMT_ONLY_LEFT;
+  i2sConfig.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  i2sConfig.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
+  i2sConfig.dma_buf_count = 8;
+  i2sConfig.dma_buf_len = MIC_FRAME_SAMPLES;
+  i2sConfig.use_apll = false;
+  i2sConfig.tx_desc_auto_clear = true;
+  i2sConfig.fixed_mclk = 0;
+
+  i2s_pin_config_t pins = {};
+  pins.mck_io_num = I2S_PIN_NO_CHANGE;
+  pins.bck_io_num = SPEAKER_BCLK_PIN;
+  pins.ws_io_num = SPEAKER_LRCLK_PIN;
+  pins.data_out_num = SPEAKER_DATA_PIN;
+  pins.data_in_num = I2S_PIN_NO_CHANGE;
+
+  esp_err_t result = i2s_driver_install(SPEAKER_I2S_PORT, &i2sConfig, 0, nullptr);
+  if (result == ESP_OK) {
+    result = i2s_set_pin(SPEAKER_I2S_PORT, &pins);
+  }
+  if (result == ESP_OK) {
+    i2s_zero_dma_buffer(SPEAKER_I2S_PORT);
+    speakerReady = true;
+    Serial.printf("Speaker ready bclk=%d ws=%d data=%d gain=%d%%\n",
+                  SPEAKER_BCLK_PIN,
+                  SPEAKER_LRCLK_PIN,
+                  SPEAKER_DATA_PIN,
+                  SPEAKER_GAIN_PERCENT);
+  } else {
+    speakerReady = false;
+    Serial.printf("Speaker init failed err=%d\n", static_cast<int>(result));
+  }
+#endif
+#else
+  speakerReady = false;
+#endif
+}
+
+static void setupDisplay() {
+#if ENABLE_OLED_DISPLAY
+  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  displayReady = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  if (!displayReady) {
+    Serial.println("OLED display init failed");
+    return;
+  }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("AirMic-Relay");
+  display.println("Booting...");
+  display.display();
+  Serial.printf("OLED ready %dx%d sda=%d scl=%d\n", OLED_WIDTH, OLED_HEIGHT, OLED_SDA_PIN, OLED_SCL_PIN);
+#endif
+}
+
+static void updateDisplay() {
+#if ENABLE_OLED_DISPLAY
+  if (!displayReady || millis() - lastDisplayMs < 1000) {
+    return;
+  }
+  lastDisplayMs = millis();
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("AirMic-Relay");
+  display.print("WiFi: ");
+  display.println(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : (apEnabled ? "setup AP" : "connecting"));
+  display.print("TCP: ");
+  display.println(audioClient.connected() ? "connected" : "offline");
+  display.print("Mic: ");
+  display.print(MIC_SAMPLE_RATE);
+  display.print("Hz ");
+  display.println(slotLabel(activeSlot));
+  display.print("Up: ");
+  display.print(statusFramesSent);
+  display.print(" Down: ");
+  display.println(statusDownlinkFrames);
+  display.print("Talk: ");
+  display.println(millis() - lastDownlinkMs < 1500 ? "receiving" : "idle");
+  display.print("Speaker: ");
+  display.println(speakerReady ? "ready" : "off");
+  display.display();
+#endif
 }
 
 static void maintainWifi() {
@@ -486,9 +809,10 @@ static void reportStatus() {
   const uint32_t now = millis();
   const uint32_t elapsedMs = lastStatusMs == 0 ? 5000 : max<uint32_t>(1, now - lastStatusMs);
   const float uplinkKbps = (statusPayloadBytesSent * 8.0f) / elapsedMs;
+  const float downlinkKbps = (statusDownlinkBytes * 8.0f) / elapsedMs;
   lastStatusMs = now;
   Serial.printf(
-      "status ap=%s setup=http://192.168.4.1 wifi=%s server=%s:%u tcp=%s codec=adpcm rate=%d shift=%u mode=%s slot=%s frame=%u words=%u fps=%u up=%.1fkbps gain=%.1f gate=%u hpf=%d agc=%d target=%u bclk=%d ws=%d data=%d\n",
+      "status ap=%s setup=http://192.168.4.1 wifi=%s server=%s:%u tcp=%s codec=adpcm rate=%d shift=%u mode=%s slot=%s frame=%u words=%u fps=%u up=%.1fkbps down_fps=%u down=%.1fkbps talk=%s speaker=%d gain=%.1f gate=%u hpf=%d agc=%d target=%u bclk=%d ws=%d data=%d\n",
       apName.c_str(),
       connectionState().c_str(),
       config.serverHost.length() ? config.serverHost.c_str() : "(unset)",
@@ -502,6 +826,10 @@ static void reportStatus() {
       static_cast<unsigned>(lastWordsRead),
       static_cast<unsigned>(statusFramesSent / max<uint32_t>(1, elapsedMs / 1000)),
       uplinkKbps,
+      static_cast<unsigned>(statusDownlinkFrames / max<uint32_t>(1, elapsedMs / 1000)),
+      downlinkKbps,
+      millis() - lastDownlinkMs < 1500 ? "receiving" : "idle",
+      speakerReady ? 1 : 0,
       config.inputGain,
       config.noiseGate,
       config.highPass ? 1 : 0,
@@ -512,6 +840,8 @@ static void reportStatus() {
       I2S_DATA_PIN);
   statusFramesSent = 0;
   statusPayloadBytesSent = 0;
+  statusDownlinkFrames = 0;
+  statusDownlinkBytes = 0;
 }
 
 static float applyHighPass(float sample) {
@@ -627,6 +957,145 @@ static size_t encodeAdpcmFrame(size_t samplesRead) {
   return out;
 }
 
+static size_t audioPayloadBytes(uint16_t samples, uint8_t codec) {
+  if (codec == AUDIO_CODEC_PCM16) {
+    return static_cast<size_t>(samples) * sizeof(int16_t);
+  }
+  if (codec == AUDIO_CODEC_IMA_ADPCM) {
+    return (static_cast<size_t>(samples) + 1) / 2;
+  }
+  return 0;
+}
+
+static size_t decodeImaAdpcmFrame(const uint8_t *payload, size_t payloadBytes, uint16_t samples, int16_t predictor, uint8_t stepIndex) {
+  int currentPredictor = predictor;
+  int currentStepIndex = min<int>(88, stepIndex);
+  size_t out = 0;
+  for (size_t i = 0; i < payloadBytes && out < samples; ++i) {
+    const uint8_t byte = payload[i];
+    for (uint8_t half = 0; half < 2 && out < samples; ++half) {
+      const uint8_t code = half == 0 ? (byte & 0x0F) : (byte >> 4);
+      const int step = IMA_STEP_TABLE[currentStepIndex];
+      int delta = step >> 3;
+      if (code & 4) delta += step;
+      if (code & 2) delta += step >> 1;
+      if (code & 1) delta += step >> 2;
+      currentPredictor += (code & 8) ? -delta : delta;
+      if (currentPredictor > 32767) currentPredictor = 32767;
+      if (currentPredictor < -32768) currentPredictor = -32768;
+      currentStepIndex += IMA_INDEX_TABLE[code & 0x0F];
+      if (currentStepIndex < 0) currentStepIndex = 0;
+      if (currentStepIndex > 88) currentStepIndex = 88;
+      downlinkPcmBuffer[out++] = static_cast<int16_t>(currentPredictor);
+    }
+  }
+  return out;
+}
+
+static size_t decodeDownlinkFrame(const AudioFrameHeader &header, const uint8_t *payload, size_t payloadBytes) {
+  if (header.codec == AUDIO_CODEC_PCM16) {
+    const size_t samples = min(static_cast<size_t>(header.samples), payloadBytes / sizeof(int16_t));
+    memcpy(downlinkPcmBuffer, payload, samples * sizeof(int16_t));
+    return samples;
+  }
+  if (header.codec == AUDIO_CODEC_IMA_ADPCM) {
+    return decodeImaAdpcmFrame(payload, payloadBytes, header.samples, header.predictor, header.stepIndex);
+  }
+  return 0;
+}
+
+static void playSpeakerPcm(size_t samples) {
+#if ENABLE_SPEAKER
+  if (!speakerReady || samples == 0) {
+    return;
+  }
+  const int gain = max(0, min(200, SPEAKER_GAIN_PERCENT));
+  if (gain != 100) {
+    for (size_t i = 0; i < samples; ++i) {
+      int32_t sample = static_cast<int32_t>(downlinkPcmBuffer[i]) * gain / 100;
+      if (sample > 32767) sample = 32767;
+      if (sample < -32768) sample = -32768;
+      downlinkPcmBuffer[i] = static_cast<int16_t>(sample);
+    }
+  }
+  size_t written = 0;
+#if ENABLE_ES8311_CODEC
+  i2s_write(I2S_PORT, downlinkPcmBuffer, samples * sizeof(int16_t), &written, pdMS_TO_TICKS(30));
+#else
+  i2s_write(SPEAKER_I2S_PORT, downlinkPcmBuffer, samples * sizeof(int16_t), &written, pdMS_TO_TICKS(30));
+#endif
+#else
+  (void)samples;
+#endif
+}
+
+static void processDownlinkBuffer() {
+  while (downlinkBytesBuffered >= sizeof(AudioFrameHeader)) {
+    size_t pos = 0;
+    while (pos + sizeof(uint32_t) <= downlinkBytesBuffered) {
+      uint32_t magic = 0;
+      memcpy(&magic, downlinkBuffer + pos, sizeof(magic));
+      if (magic == AUDIO_MAGIC) {
+        break;
+      }
+      ++pos;
+    }
+    if (pos > 0) {
+      memmove(downlinkBuffer, downlinkBuffer + pos, downlinkBytesBuffered - pos);
+      downlinkBytesBuffered -= pos;
+    }
+    if (downlinkBytesBuffered < sizeof(AudioFrameHeader)) {
+      return;
+    }
+
+    AudioFrameHeader header = {};
+    memcpy(&header, downlinkBuffer, sizeof(header));
+    if (header.magic != AUDIO_MAGIC) {
+      memmove(downlinkBuffer, downlinkBuffer + 1, downlinkBytesBuffered - 1);
+      downlinkBytesBuffered -= 1;
+      continue;
+    }
+    const size_t payloadBytes = audioPayloadBytes(header.samples, header.codec);
+    if (payloadBytes == 0 || payloadBytes > sizeof(pcmBuffer)) {
+      memmove(downlinkBuffer, downlinkBuffer + sizeof(uint32_t), downlinkBytesBuffered - sizeof(uint32_t));
+      downlinkBytesBuffered -= sizeof(uint32_t);
+      continue;
+    }
+    const size_t totalBytes = sizeof(AudioFrameHeader) + payloadBytes;
+    if (downlinkBytesBuffered < totalBytes) {
+      return;
+    }
+
+    const size_t samples = decodeDownlinkFrame(header, downlinkBuffer + sizeof(AudioFrameHeader), payloadBytes);
+    playSpeakerPcm(samples);
+    lastDownlinkMs = millis();
+    statusDownlinkFrames++;
+    statusDownlinkBytes += totalBytes;
+    memmove(downlinkBuffer, downlinkBuffer + totalBytes, downlinkBytesBuffered - totalBytes);
+    downlinkBytesBuffered -= totalBytes;
+  }
+}
+
+static void receiveDownlinkAudio() {
+  if (!audioClient.connected()) {
+    downlinkBytesBuffered = 0;
+    return;
+  }
+  while (audioClient.available() > 0) {
+    if (downlinkBytesBuffered >= sizeof(downlinkBuffer)) {
+      memmove(downlinkBuffer, downlinkBuffer + sizeof(uint32_t), downlinkBytesBuffered - sizeof(uint32_t));
+      downlinkBytesBuffered -= sizeof(uint32_t);
+    }
+    const size_t capacity = sizeof(downlinkBuffer) - downlinkBytesBuffered;
+    const int readBytes = audioClient.read(downlinkBuffer + downlinkBytesBuffered, capacity);
+    if (readBytes <= 0) {
+      break;
+    }
+    downlinkBytesBuffered += static_cast<size_t>(readBytes);
+    processDownlinkBuffer();
+  }
+}
+
 static void updateAutoSlot(size_t samplesRead) {
   if (samplesRead == 0) {
     return;
@@ -647,6 +1116,38 @@ static void updateAutoSlot(size_t samplesRead) {
 }
 
 static size_t readPcmFrame() {
+#if ENABLE_ES8311_CODEC
+  size_t bytesRead = 0;
+  uint8_t *dest = reinterpret_cast<uint8_t *>(codecRxBuffer);
+  const uint32_t startedAt = millis();
+  while (bytesRead < sizeof(codecRxBuffer)) {
+    size_t chunkBytes = 0;
+    const esp_err_t result = i2s_read(
+        I2S_PORT,
+        dest + bytesRead,
+        sizeof(codecRxBuffer) - bytesRead,
+        &chunkBytes,
+        pdMS_TO_TICKS(40));
+    if (result != ESP_OK || chunkBytes == 0) {
+      break;
+    }
+    bytesRead += chunkBytes;
+    if (millis() - startedAt >= 80) {
+      break;
+    }
+  }
+  if (bytesRead == 0) {
+    return 0;
+  }
+  const size_t samplesRead = min(bytesRead / sizeof(codecRxBuffer[0]), static_cast<size_t>(MIC_FRAME_SAMPLES));
+  lastWordsRead = samplesRead;
+  lastSamplesRead = samplesRead;
+  activeSlot = 0;
+  for (size_t i = 0; i < samplesRead; ++i) {
+    pcmBuffer[i] = shapeVoiceSample(codecRxBuffer[i]);
+  }
+  return samplesRead;
+#else
   size_t bytesRead = 0;
   uint8_t *dest = reinterpret_cast<uint8_t *>(i2sBuffer);
   const uint32_t startedAt = millis();
@@ -692,6 +1193,7 @@ static size_t readPcmFrame() {
     pcmBuffer[i] = shapeVoiceSample(sample);
   }
   return samplesRead;
+#endif
 }
 
 static void sendAudioFrame(size_t samplesRead) {
@@ -727,9 +1229,11 @@ void setup() {
   Serial.begin(921600);
   delay(1200);
   loadConfig();
+  setupDisplay();
   setupConfigPortal();
   beginStationConnect();
   setupI2SMicrophone();
+  setupSpeaker();
   resetVoiceState();
   Serial.printf("I2S ready rate=%d frame=%d words=%u shift=%u mode=%s slot=%s gain=%.1f gate=%u hpf=%d agc=%d target=%u bclk=%d ws=%d data=%d\n",
                 MIC_SAMPLE_RATE,
@@ -755,8 +1259,11 @@ void loop() {
   webServer.handleClient();
   maintainWifi();
   maintainAudioClient();
+  receiveDownlinkAudio();
   reportStatus();
+  updateDisplay();
 
   const size_t samplesRead = readPcmFrame();
   sendAudioFrame(samplesRead);
+  receiveDownlinkAudio();
 }

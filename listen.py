@@ -61,6 +61,7 @@ WEB_PAGE = """<!doctype html>
       <div class="row">
         <button id="start">Start listening</button>
         <button id="stop" class="secondary">Stop</button>
+        <button id="talk" class="secondary">Talk to ESP32</button>
         <select id="mode">
           <option value="live">Live</option>
           <option value="balanced" selected>Balanced</option>
@@ -108,10 +109,12 @@ WEB_PAGE = """<!doctype html>
       stable: {targetMs: 380, maxMs: 760, label: 'most resistant to jitter'}
     };
     let ws, ctx, gainNode, filterNode, compressorNode, workletNode, scriptNode, stash = new Uint8Array(0), running = false;
+    let micStream = null, talkCtx = null, talkSource = null, talkNode = null, talking = false;
+    let talkRemainder = new Float32Array(0);
     let streamRate = 16000, underruns = 0, packetCount = 0;
     let fallbackQueue = [], fallbackOffset = 0, fallbackQueuedSamples = 0;
     const conn = document.getElementById('conn'), sourceEl = document.getElementById('source'), audio = document.getElementById('audio'), buffer = document.getElementById('buffer'), msg = document.getElementById('message'), bar = document.getElementById('bar');
-    const modeEl = document.getElementById('mode'), gainEl = document.getElementById('gain'), gainVal = document.getElementById('gainVal');
+    const modeEl = document.getElementById('mode'), gainEl = document.getElementById('gain'), gainVal = document.getElementById('gainVal'), talkBtn = document.getElementById('talk');
     let statusTimer = null;
 
     function merge(a, b) {
@@ -412,6 +415,95 @@ WEB_PAGE = """<!doctype html>
       }
     }
 
+    function concatFloat32(a, b) {
+      if (!a.length) return b;
+      const out = new Float32Array(a.length + b.length);
+      out.set(a, 0);
+      out.set(b, a.length);
+      return out;
+    }
+
+    function makePcmFrame(samples, rate) {
+      const frame = new Uint8Array(HEADER_BYTES + samples.length * 2);
+      const view = new DataView(frame.buffer);
+      frame[0] = 65; frame[1] = 85; frame[2] = 68; frame[3] = 48;
+      view.setUint16(4, samples.length, true);
+      view.setUint16(6, rate, true);
+      view.setUint8(8, CODEC_PCM16);
+      view.setUint8(9, 0);
+      view.setInt16(10, 0, true);
+      for (let i = 0; i < samples.length; i++) {
+        const value = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(HEADER_BYTES + i * 2, value < 0 ? value * 32768 : value * 32767, true);
+      }
+      return frame;
+    }
+
+    function sendTalkAudio(input, fromRate) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const mono16k = resampleLinear(input, fromRate, 16000);
+      talkRemainder = concatFloat32(talkRemainder, mono16k);
+      while (talkRemainder.length >= 320) {
+        const chunk = talkRemainder.slice(0, 320);
+        talkRemainder = talkRemainder.slice(320);
+        ws.send(makePcmFrame(chunk, 16000));
+      }
+    }
+
+    async function startTalking() {
+      if (talking) return;
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        msg.textContent = 'Microphone requires HTTPS or localhost in this browser.';
+        return;
+      }
+      if (!running) await startListening();
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        msg.textContent = 'Connect first, then start talk.';
+        return;
+      }
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1
+        }
+      });
+      talkCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+      await talkCtx.resume();
+      talkSource = talkCtx.createMediaStreamSource(micStream);
+      talkNode = talkCtx.createScriptProcessor(1024, 1, 1);
+      talkRemainder = new Float32Array(0);
+      talkNode.onaudioprocess = (event) => {
+        const input = event.inputBuffer.getChannelData(0);
+        const output = event.outputBuffer.getChannelData(0);
+        output.fill(0);
+        sendTalkAudio(new Float32Array(input), talkCtx.sampleRate);
+      };
+      talkSource.connect(talkNode);
+      talkNode.connect(talkCtx.destination);
+      talking = true;
+      talkBtn.textContent = 'Stop talking';
+      talkBtn.className = '';
+      msg.textContent = 'Talking to ESP32 speaker...';
+    }
+
+    async function stopTalking() {
+      talking = false;
+      talkRemainder = new Float32Array(0);
+      if (talkNode) talkNode.disconnect();
+      if (talkSource) talkSource.disconnect();
+      if (micStream) micStream.getTracks().forEach(track => track.stop());
+      if (talkCtx) await talkCtx.close();
+      talkNode = null;
+      talkSource = null;
+      micStream = null;
+      talkCtx = null;
+      talkBtn.textContent = 'Talk to ESP32';
+      talkBtn.className = 'secondary';
+      if (running) msg.textContent = 'Listening live in ' + modeEl.value + ' mode.';
+    }
+
     async function startListening() {
       if (running) return;
       running = true;
@@ -466,6 +558,7 @@ WEB_PAGE = """<!doctype html>
 
     async function stopListening() {
       running = false;
+      if (talking) await stopTalking();
       if (ws) ws.close();
       ws = null;
       if (ctx) await ctx.close();
@@ -484,6 +577,15 @@ WEB_PAGE = """<!doctype html>
 
     document.getElementById('start').onclick = startListening;
     document.getElementById('stop').onclick = stopListening;
+    talkBtn.onclick = async () => {
+      try {
+        if (talking) await stopTalking();
+        else await startTalking();
+      } catch (error) {
+        msg.textContent = 'Talk failed: ' + error.message;
+        await stopTalking();
+      }
+    };
     modeEl.onchange = applyMode;
     gainEl.oninput = updateGain;
     updateGain();
@@ -843,6 +945,49 @@ def websocket_frame(payload):
     return bytes([0x82, 127]) + struct.pack("!Q", size) + payload
 
 
+def websocket_messages(buffer):
+    messages = []
+    offset = 0
+    close_requested = False
+    while len(buffer) - offset >= 2:
+        first = buffer[offset]
+        second = buffer[offset + 1]
+        opcode = first & 0x0F
+        masked = bool(second & 0x80)
+        size = second & 0x7F
+        header_size = 2
+        if size == 126:
+            if len(buffer) - offset < 4:
+                break
+            size = struct.unpack("!H", buffer[offset + 2:offset + 4])[0]
+            header_size = 4
+        elif size == 127:
+            if len(buffer) - offset < 10:
+                break
+            size = struct.unpack("!Q", buffer[offset + 2:offset + 10])[0]
+            header_size = 10
+        if masked:
+            if len(buffer) - offset < header_size + 4:
+                break
+            mask = buffer[offset + header_size:offset + header_size + 4]
+            header_size += 4
+        else:
+            mask = b""
+        frame_end = offset + header_size + size
+        if len(buffer) < frame_end:
+            break
+        payload = bytes(buffer[offset + header_size:frame_end])
+        if masked:
+            payload = bytes(value ^ mask[i % 4] for i, value in enumerate(payload))
+        if opcode == 0x8:
+            close_requested = True
+        elif opcode == 0x2:
+            messages.append(payload)
+        offset = frame_end
+    del buffer[:offset]
+    return messages, close_requested
+
+
 def http_response(body, status="200 OK", content_type="text/html; charset=utf-8", extra_headers=None):
     data = body if isinstance(body, bytes) else body.encode("utf-8")
     headers = (
@@ -1003,7 +1148,9 @@ def run_server(args):
     source = None
     clients = set()
     web_clients = set()
+    web_buffers = {}
     total_bytes = 0
+    talk_bytes = 0
     last_report = time.monotonic()
 
     print(
@@ -1048,6 +1195,7 @@ def run_server(args):
                 if upgraded:
                     conn.setblocking(False)
                     web_clients.add(conn)
+                    web_buffers[conn] = bytearray()
                     sel.register(conn, selectors.EVENT_READ, "websocket")
                     print(f"Web listener upgraded clients={len(web_clients)}", flush=True)
                 else:
@@ -1060,8 +1208,31 @@ def run_server(args):
                     chunk = b""
                 if not chunk:
                     web_clients.discard(key.fileobj)
+                    web_buffers.pop(key.fileobj, None)
                     close_socket(sel, key.fileobj)
                     print(f"Web listener disconnected clients={len(web_clients)}", flush=True)
+                else:
+                    buffer = web_buffers.setdefault(key.fileobj, bytearray())
+                    buffer.extend(chunk)
+                    messages, close_requested = websocket_messages(buffer)
+                    if close_requested:
+                        web_clients.discard(key.fileobj)
+                        web_buffers.pop(key.fileobj, None)
+                        close_socket(sel, key.fileobj)
+                        print(f"Web listener disconnected clients={len(web_clients)}", flush=True)
+                        continue
+                    for message in messages:
+                        if source is None:
+                            continue
+                        try:
+                            source.sendall(message)
+                            talk_bytes += len(message)
+                        except OSError:
+                            print("ESP32 source disconnected during talk downlink", flush=True)
+                            close_socket(sel, source)
+                            source = None
+                            recorder.close()
+                            break
 
             elif key.data == "source":
                 try:
@@ -1095,6 +1266,7 @@ def run_server(args):
                         web_dead.append(client)
                 for client in web_dead:
                     web_clients.remove(client)
+                    web_buffers.pop(client, None)
                     close_socket(sel, client)
                     print(f"Web listener disconnected clients={len(web_clients)}", flush=True)
 
@@ -1102,10 +1274,11 @@ def run_server(args):
         if now - last_report >= 5:
             kbps = (total_bytes * 8 / 1000) / (now - last_report)
             print(
-                f"status source={'yes' if source else 'no'} tcp_clients={len(clients)} web_clients={len(web_clients)} rate={kbps:.1f} kbit/s",
+                f"status source={'yes' if source else 'no'} tcp_clients={len(clients)} web_clients={len(web_clients)} rate={kbps:.1f} kbit/s talk_down={(talk_bytes * 8 / 1000) / (now - last_report):.1f} kbit/s",
                 flush=True,
             )
             total_bytes = 0
+            talk_bytes = 0
             last_report = now
 
 
